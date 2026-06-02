@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# 개발 임시 파일
+debug*.py
+profile_v8.py
+verify_v8.py
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# 결과 파일 (대용량, 재생성 가능)
+results/
+
+# Kaggle 인증 (절대 포함 금지)
+kaggle.json
+credentials.json
+*.key
+access_token
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python version manager
+.python-version
+
+# examples는 공개 코드이므로 포함
+# ./examples  ← 제거
