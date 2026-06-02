@@ -2,6 +2,62 @@
 
 ---
 
+## 핵심 교훈 — 협공(Coop Attack)에 대하여
+
+### 왜 단순 협공이 실패하는가
+
+orbit_wars 전투 규칙:
+```
+같은 턴에 도착한 함대 → 합산 후 일괄 전투 (동시 도착이면 협공 성립)
+다른 턴에 도착한 함대 → 순차 전투 (각자 싸움, 협공 불성립)
+```
+
+순차 전투 예시 (garrison=60, Fleet A=50, Fleet B=30):
+```
+턴 10: A 50척 vs 60 → A 패배, garrison=10
+턴 13: B 30척 vs 10+3*production → B 간신히 승리 or 패배
+```
+총 80척 투입, 결과가 불확실. 동시 도착이었다면 80 vs 60 → 확실한 승리.
+
+### 동시 도착 보장 방법 (v9 구현 목표)
+
+각 행성에서 출발 시각을 조율해서 같은 턴에 도착하게 설계:
+
+```python
+# 원하는 도착 턴: target_arrival_turn
+# 행성 A: dist_A / speed(ships_A) = target_arrival_turn → ships_A = f(dist_A / target_arrival)
+# 행성 B: dist_B / speed(ships_B) = target_arrival_turn → ships_B = f(dist_B / target_arrival)
+#
+# 단, ships_A + ships_B >= garrison + production * target_arrival + 1 (점령 조건)
+```
+
+구체적으로: `fleet_speed(ships) = 1 + 5*(log(ships)/log(1000))^1.5`를 역산하여  
+목표 도착 턴에 맞는 함대 크기를 계산한다.
+
+### v9 동시 협공 알고리즘 설계
+
+```
+1. 대상 타깃 선택 (단독으로 점령 불가능한 적 행성)
+2. 후보 행성들의 거리 계산
+3. 공통 도착 턴 T 결정:
+   - T = max(각 행성의 최소 도착 턴)  ← 모두 도달 가능한 가장 이른 턴
+4. 각 행성이 T턴에 도착하기 위한 함대 크기 계산:
+   - dist / T = required_speed → ships = inverse_speed(required_speed)
+5. garrison = target.ships + production * T
+6. 총 ships >= garrison + 1 이면 협공 실행
+7. 각 행성에서 계산된 ships만큼 발사
+```
+
+### 주의사항
+- 공전 행성(orbiting)은 T턴의 위치를 predict_position으로 예측해야 함
+- path_hits_sun 검증 필수
+- 단독 공격이 가능한 타깃에는 협공 불필요 (낭비)
+- 협공 대상: 총 가용 병력 합산 >= garrison 이지만 단독으로는 불가능한 경우만
+
+---
+
+---
+
 ## v5 베이스라인 (기준)
 
 **핵심 로직**: 아군 함대 중복 공격 제거 + iterative aiming + 점수 기반 타깃 선택
