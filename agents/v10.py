@@ -1,20 +1,21 @@
 """
-v11: v10 + Accumulator/Hammer/Multiprong
+v10: v9 + Melis Forward Score (hybrid approach)
 
-의도한 전략:
-1. Accumulator: 후반 게임(neutral_ratio < 0.35)에서 lead 행성에 함대 집중
-   - 나머지(feeder) 행성들의 여유 ships를 lead로 전송
-   - Lead를 일반 공격에서 제외 (hammer를 위해 예약)
+핵심 전략:
+- v9의 모든 공격 아키텍처(while 루프, exhaustive target search) 유지
+- 타깃 스코어에 Melis gain을 보너스로 추가
+  score_v10 = score_v9 + MELIS_WEIGHT * melis_gain
+- 이렇게 하면 v9와 동일한 공격 빈도를 유지하면서 더 좋은 타깃 선택
 
-2. Hammer: Lead ships ≥ HAMMER_STOCKPILE_MIN 달성 시 적 요새 일격
-   - 타깃: Hammer 거리 내 최고 production 적 행성
-   - 발사량: garrison × HAMMER_OVERKILL_RATIO (안전 마진 포함)
+Melis forward projection:
+- 20턴 미래 시뮬레이션
+- forward_score = ships_diff + 5×planets_diff + 8×prod_diff
+- 스냅샷 가중평균 (1/t weight: 4턴이 20턴보다 5배 신뢰)
+- 상대 이동: 4턴마다 20% 함대 발사 (간이 시뮬)
 
-3. Multiprong: Hammer 발사 시 인접 적 행성도 동시 공격
-   - 상대가 hammer 타깃 방어 OR secondary 방어 중 하나만 선택 가능
-   - 강제 딜레마 효과
-
-4. (v10 유지) Melis 보너스 타깃 스코어 + 전반 게임 협공
+전반 게임 협공:
+- neutral_ratio 제약 없음 (v9의 0.35 제약 제거)
+- 순차 도착 허용
 """
 import math
 from collections import defaultdict
@@ -32,33 +33,6 @@ SUN_X, SUN_Y, SUN_R = 50.0, 50.0, 10.0
 MAX_SPEED = 6.0
 MIN_FLEET = 5
 TOTAL_STEPS = 500
-
-# ══════════════════════════════════════════════════════════════════════
-# 조절 파라미터 — 값과 의미 설명
-# ══════════════════════════════════════════════════════════════════════
-
-# ── Hammer 파라미터 (잉여 함대로만 발사 — 일반 공격·협공 후 섹션 9) ──────
-HAMMER_ENABLED         = True  # False면 순수 v10 동작 (중립성 검증용)
-HAMMER_STOCKPILE_MIN   = 70    # hammer 발사 최소 잉여 ships [높이면 더 강한 punch]
-HAMMER_TARGET_PROD_MIN = 1     # hammer 대상 최소 production [낮추면 약한 타깃도 공격]
-HAMMER_OVERKILL_RATIO  = 1.35  # garrison 대비 발사 배수 [높이면 더 확실, 더 비쌈]
-HAMMER_MAX_TRAVEL      = 12    # hammer 최대 이동 거리(턴) [짧을수록 함대가 빨리 복귀, 장거리 hammer는 회귀]
-
-# ── Accumulator: 비활성화 (현 설계는 feeder→lead 전송 없이 잉여로만 hammer)
-ACCUM_ENABLED = False  # True로 바꾸면 feeder→lead 전송 활성화 [실험적]
-
-# ── Multiprong 파라미터 ──────────────────────────────────────────────
-MULTIPRONG_ENABLED     = True  # multiprong 기능 활성화 여부
-MULTIPRONG_SHIPS_RATIO = 0.45  # hammer 타깃 garrison 대비 secondary 발사 비율 [조절]
-MULTIPRONG_MAX_TRAVEL  = 28    # secondary 최대 이동 거리(턴) [조절]
-
-# ── Melis 파라미터 ───────────────────────────────────────────────────
-MELIS_HORIZON    = 20
-MELIS_SNAP_TURNS = (4, 8, 14, 20)
-MELIS_OPP_FRAC   = 0.15
-MELIS_WEIGHT     = 1.5    # Melis gain의 v9 스코어 대비 가중치 [조절]
-
-# ══════════════════════════════════════════════════════════════════════
 
 from collections import namedtuple
 Planet = namedtuple("Planet", ["id", "owner", "x", "y", "radius", "ships", "production"])
@@ -105,10 +79,18 @@ def predict_position(p, ang_vel: float, turns: float):
 
 # ─── Melis Forward Evaluation ─────────────────────────────────────────────────
 
+MELIS_HORIZON   = 20
+MELIS_SNAP_TURNS = (4, 8, 14, 20)
+MELIS_OPP_FRAC  = 0.15   # 상대 4턴마다 15% 발사 (보수적)
+MELIS_WEIGHT    = 1.5    # Melis gain의 v9 score에 대한 가중치
+
+
 def forward_project(world, our_capture_target=None, our_capture_turn=None,
                     our_capture_ships=None, horizon=MELIS_HORIZON,
                     snapshot_turns=None):
+    """단순 forward simulation (상대 이동 포함)."""
     player = world.player
+
     by_pid: dict = defaultdict(list)
     for pid, arrs in world.arrivals_by_planet.items():
         for eta, owner, ships in arrs:
@@ -125,6 +107,7 @@ def forward_project(world, our_capture_target=None, our_capture_turn=None,
         state[p.id] = [int(p.owner), int(p.ships), int(p.production)]
 
     planet_pos = {p.id: (float(p.x), float(p.y)) for p in world.planets}
+
     snap_set = set(snapshot_turns) if snapshot_turns else set()
     snapshots = {}
 
@@ -133,6 +116,7 @@ def forward_project(world, our_capture_target=None, our_capture_turn=None,
             if st[0] != -1:
                 st[1] += st[2]
 
+        # 상대 간이 이동 (4턴마다)
         if t % 4 == 0:
             for pid, st in state.items():
                 if st[0] == -1 or st[0] == player or st[1] < 10:
@@ -143,8 +127,8 @@ def forward_project(world, our_capture_target=None, our_capture_turn=None,
                 for opid, ost in state.items():
                     if opid == pid or ost[0] == src_owner:
                         continue
-                    d = math.hypot(src_x - planet_pos[opid][0],
-                                   src_y - planet_pos[opid][1])
+                    ox, oy = planet_pos[opid]
+                    d = math.hypot(src_x - ox, src_y - oy)
                     if d < best_d:
                         best_d, best_op = d, opid
                 if best_op is None:
@@ -159,6 +143,7 @@ def forward_project(world, our_capture_target=None, our_capture_turn=None,
                 by_pid[best_op].append((t + eta_arrive, src_owner, emit))
                 st[1] -= emit
 
+        # 도착 처리 + 전투
         for pid, arrs in by_pid.items():
             this_turn = [(o, s) for et, o, s in arrs if et == t]
             if not this_turn:
@@ -215,9 +200,12 @@ def _forward_score(snap: dict, player: int, planet_prod: dict) -> float:
 
 def melis_score(world, capture_target=None, capture_turn=None, capture_ships=None) -> float:
     _, snaps = forward_project(
-        world, our_capture_target=capture_target,
-        our_capture_turn=capture_turn, our_capture_ships=capture_ships,
-        horizon=MELIS_HORIZON, snapshot_turns=MELIS_SNAP_TURNS,
+        world,
+        our_capture_target=capture_target,
+        our_capture_turn=capture_turn,
+        our_capture_ships=capture_ships,
+        horizon=MELIS_HORIZON,
+        snapshot_turns=MELIS_SNAP_TURNS,
     )
     total = weight_sum = 0.0
     for t in MELIS_SNAP_TURNS:
@@ -230,21 +218,25 @@ def melis_score(world, capture_target=None, capture_turn=None, capture_ships=Non
     return total / max(1e-9, weight_sum)
 
 
-# ─── World 파싱 ────────────────────────────────────────────────────────────────
+# ─── World: obs 파싱 ────────────────────────────────────────────────────────────
 
 class World:
     def __init__(self, obs):
         _r = lambda key, default: (obs.get(key, default) if isinstance(obs, dict)
                                    else getattr(obs, key, default))
+
         self.player  = _r("player", 0)
         self.step    = _r("step", 0) or 0
         self.ang_vel = _r("angular_velocity", 0.0) or 0.0
+
         raw_planets = _r("planets", []) or []
         raw_fleets  = _r("fleets",  []) or []
+
         self.planets    = [Planet(*p) for p in raw_planets]
         self.fleets     = [Fleet(*f)  for f in raw_fleets]
         self.planet_map = {p.id: p for p in self.planets}
         self.planet_prod = {p.id: int(p.production) for p in self.planets}
+
         self.arrivals_by_planet: dict = defaultdict(list)
         self._build_arrivals()
 
@@ -257,6 +249,7 @@ class World:
             dist = math.hypot(f.x - tgt.x, f.y - tgt.y)
             eta  = math.ceil(dist / fleet_speed(f.ships))
             self.arrivals_by_planet[target_id].append((int(eta), int(f.owner), int(f.ships)))
+
         for pid in self.arrivals_by_planet:
             self.arrivals_by_planet[pid].sort()
 
@@ -276,7 +269,7 @@ class World:
         return None
 
 
-# ─── 타임라인 시뮬레이션 ──────────────────────────────────────────────────────
+# ─── 행성 타임라인 시뮬레이션 (v9 그대로) ──────────────────────────────────────────
 
 @dataclass
 class PlanetTimeline:
@@ -293,8 +286,10 @@ def simulate_planet_timeline(planet: Planet, arrivals: list, player: int,
     owner = player
     arr_idx = 0
     n = len(arrivals)
+
     for turn in range(1, horizon + 1):
-        friendly_arrive = enemy_arrive = 0
+        friendly_arrive = 0
+        enemy_arrive = 0
         while arr_idx < n and arrivals[arr_idx][0] == turn:
             _, arr_owner, arr_ships = arrivals[arr_idx]
             if arr_owner == player:
@@ -302,20 +297,28 @@ def simulate_planet_timeline(planet: Planet, arrivals: list, player: int,
             else:
                 enemy_arrive += arr_ships
             arr_idx += 1
+
         if owner == player:
             ships += planet.production
+
         ships += friendly_arrive
-        if enemy_arrive > 0 and owner == player:
-            ships -= enemy_arrive
-            if ships < 0:
-                tl.holds = False
-                tl.fall_turn = turn
-                tl.deficit = int(-ships) + 1
+
+        if enemy_arrive > 0:
+            if owner == player:
+                ships -= enemy_arrive
+                if ships < 0:
+                    owner = -999
+                    tl.holds = False
+                    tl.fall_turn = turn
+                    tl.deficit = int(-ships) + 1
+                    break
+            else:
                 break
+
     return tl
 
 
-# ─── 조준 / 스코어 헬퍼 ───────────────────────────────────────────────────────
+# ─── 조준 / 점수 (v9 그대로 + Melis 보너스) ───────────────────────────────────────
 
 def aim_iterative(mine, target, ships: int, ang_vel: float):
     dist_cur = math.hypot(mine.x - target.x, mine.y - target.y)
@@ -371,78 +374,27 @@ def race_margin(target, my_planets, enemy_planets) -> float:
 
 def target_score(t, dist, ships_needed, turns, step, melis_gain=0.0,
                  margin=0.0, iwealth=0.0, neutral_ratio=1.0) -> float:
+    """v9 스코어 + Melis gain 보너스."""
     remaining = max(1, TOTAL_STEPS - step)
     enemy_bonus = 10 if t.owner >= 0 else 0
     base = (100 - dist) + 15 * t.production + enemy_bonus \
            - 0.7 * ships_needed - 2 * turns + iwealth * 0.15
+
     if t.owner < 0:
         base += margin * 3.0
     else:
-        base += (1.0 - neutral_ratio) * 30.0
+        phase_bonus = (1.0 - neutral_ratio) * 30.0
+        base += phase_bonus
+
     remaining_after = max(0, remaining - turns)
     roi = t.production * remaining_after - ships_needed
     if roi < 0:
         base += roi * 0.5
+
+    # Melis 보너스: forward simulation 기반 추가 가산점
     base += MELIS_WEIGHT * melis_gain
+
     return base
-
-
-# ─── Hammer 헬퍼 ─────────────────────────────────────────────────────────────
-# 주 hammer 타깃 선택은 agent() 섹션 9에 인라인(잉여 함대 기준). 여기는 보조 공격만.
-
-def pick_multiprong_secondary(world, hammer_target, my_planets, enemy_planets,
-                               pending_ships, lead_id, committed_targets,
-                               remaining_turns):
-    """
-    multiprong secondary 타깃 선택:
-    - Hammer 타깃 인근의 다른 적 행성
-    - Lead가 아닌 행성에서 발사 가능
-    - MULTIPRONG_SHIPS_RATIO × hammer_garrison 정도의 함대로 공격
-    """
-    if hammer_target is None:
-        return None
-
-    ht = hammer_target
-    best = None
-    best_dist = math.inf
-
-    for t in enemy_planets:
-        if t.id == ht.id or t.id in committed_targets:
-            continue
-        # hammer 타깃 인근 (가까울수록 딜레마 효과 큼)
-        d_to_hammer = math.hypot(t.x - ht.x, t.y - ht.y)
-        if d_to_hammer > 60:
-            continue
-
-        # 발사 가능한 소스 행성 찾기 (lead 제외)
-        for mine in my_planets:
-            if mine.id == lead_id:
-                continue
-            avail = mine.ships - pending_ships[mine.id]
-            if avail < MIN_FLEET:
-                continue
-
-            result = aim_iterative(mine, t, avail, world.ang_vel)
-            if result is None:
-                continue
-
-            angle, ships_needed, turns = result
-            if turns > MULTIPRONG_MAX_TRAVEL:
-                continue
-            if ships_needed > avail:
-                continue
-
-            remaining_after = max(0, remaining_turns - turns)
-            roi = t.production * remaining_after - ships_needed
-            if roi < 0:
-                continue
-
-            dist_from_mine = math.hypot(mine.x - t.x, mine.y - t.y)
-            if dist_from_mine < best_dist:
-                best_dist = dist_from_mine
-                best = (mine, t, angle, ships_needed)
-
-    return best
 
 
 # ─── 에이전트 ──────────────────────────────────────────────────────────────────
@@ -461,54 +413,73 @@ def agent(obs):
 
     pending_ships = {p.id: 0 for p in my_planets}
 
-    # ── 1. 타임라인 시뮬레이션 ────────────────────────────────────────────────
-    timelines: dict = {}
+    # ── 1. 내 행성 타임라인 시뮬레이션 ────────────────────────────────────────
+    timelines: dict[int, PlanetTimeline] = {}
     for p in my_planets:
         arrivals = world.arrivals_by_planet.get(p.id, [])
         timelines[p.id] = simulate_planet_timeline(p, arrivals, player)
 
     # ── 2. 도주(Evacuation) ────────────────────────────────────────────────────
+    EVAC_HORIZON = 10
+    EVAC_MIN_SHIPS = MIN_FLEET
+
     for p in sorted(my_planets, key=lambda x: timelines[x.id].fall_turn or 999):
         tl = timelines[p.id]
-        if not tl.holds and tl.fall_turn is not None and tl.fall_turn <= 10:
-            avail = p.ships - pending_ships[p.id]
-            if avail < MIN_FLEET:
+        if not tl.holds and tl.fall_turn is not None and tl.fall_turn <= EVAC_HORIZON:
+            available = p.ships - pending_ships[p.id]
+            if available < EVAC_MIN_SHIPS:
                 continue
-            best_dest = min(
-                (d for d in my_planets if d.id != p.id and timelines[d.id].holds),
-                key=lambda d: math.hypot(p.x - d.x, p.y - d.y),
-                default=None
-            )
+
+            evac_ships = available
+
+            best_dest = None
+            best_dist = math.inf
+            for dest in my_planets:
+                if dest.id == p.id:
+                    continue
+                if timelines[dest.id].holds:
+                    d = math.hypot(p.x - dest.x, p.y - dest.y)
+                    if d < best_dist:
+                        best_dist = d
+                        best_dest = dest
+
             if best_dest is None:
                 continue
+
             angle = math.atan2(best_dest.y - p.y, best_dest.x - p.x)
             if not path_hits_sun(p.x, p.y, best_dest.x, best_dest.y):
-                moves.append([p.id, angle, avail])
-                pending_ships[p.id] += avail
+                moves.append([p.id, angle, evac_ships])
+                pending_ships[p.id] += evac_ships
                 if DEBUG:
-                    print(f"[EVAC] {p.id}->{best_dest.id}: {avail}")
+                    print(f"[EVAC] {p.id}->{best_dest.id}: {evac_ships}")
 
     # ── 3. 수비(Defense) ───────────────────────────────────────────────────────
-    threatened = [(p, tl) for p in my_planets
-                  for tl in [timelines[p.id]]
-                  if not tl.holds and tl.fall_turn and tl.deficit > 0]
+    REINFORCE_MAX_ETA_MARGIN = 1
+
+    threatened = []
+    for p in my_planets:
+        tl = timelines[p.id]
+        if not tl.holds and tl.fall_turn is not None and tl.deficit > 0:
+            threatened.append((p, tl))
+
     threatened.sort(key=lambda x: x[1].fall_turn)
 
     for threatened_p, tl in threatened:
         needed = tl.deficit
+        fall_turn = tl.fall_turn
         donors = sorted(
             [p for p in my_planets if p.id != threatened_p.id],
             key=lambda p: math.hypot(p.x - threatened_p.x, p.y - threatened_p.y)
         )
         for donor in donors:
-            avail = donor.ships - pending_ships[donor.id]
-            if avail < MIN_FLEET:
+            available = donor.ships - pending_ships[donor.id]
+            if available < MIN_FLEET:
                 continue
             dist = math.hypot(donor.x - threatened_p.x, donor.y - threatened_p.y)
             eta = math.ceil(dist / fleet_speed(max(MIN_FLEET, needed)))
-            if eta >= tl.fall_turn - 1:
+            if eta >= fall_turn - REINFORCE_MAX_ETA_MARGIN:
                 continue
-            reinforce = min(avail, needed + 1)
+            reinforce = min(available, needed + 1)
             if reinforce < MIN_FLEET:
                 continue
             tx, ty = predict_position(threatened_p, world.ang_vel, eta)
@@ -523,39 +494,40 @@ def agent(obs):
             if needed <= 0:
                 break
 
+    # ── 4. 공격 ────────────────────────────────────────────────────────────────
     if not targets:
         return moves
 
     my_planets_sorted = sorted(my_planets, key=lambda p: p.ships, reverse=True)
+
+    # 비행 중 아군 함대 집계
     my_inbound: dict = {}
     for pid, arrivals in world.arrivals_by_planet.items():
-        total = sum(s for (_, o, s) in arrivals if o == player)
+        total = sum(s for (_, owner, s) in arrivals if owner == player)
         if total > 0:
             my_inbound[pid] = total
 
-    enemy_planets = [p for p in planets if p.owner not in (-1, player)]
-    n_neutral = sum(1 for t in targets if t.owner < 0)
-    neutral_ratio = n_neutral / max(1, len(targets))
-    remaining_turns = max(1, TOTAL_STEPS - world.step)
-
-    committed: dict = {}
-    attack_targeted = set()
-
-    # NOTE(v11): Hammer/Multiprong은 일반 공격·협공이 끝난 뒤 "잉여 함대"로만
-    # 발사한다(섹션 9). 주력 행성을 미리 벤치에 앉히지 않는다 — v10 교훈.
-
-    # ── 7. 일반 공격 (v10 스타일: Melis 보너스 포함) ─────────────────────────
     iwealth_cache = {t.id: indirect_wealth(t, planets, player) for t in targets}
+
+    enemy_planets = [p for p in planets if p.owner not in (-1, player)]
     race_margins = {}
     for t in targets:
         if t.owner < 0:
             race_margins[t.id] = race_margin(t, my_planets, enemy_planets)
 
+    n_neutral = sum(1 for t in targets if t.owner < 0)
+    neutral_ratio = n_neutral / max(1, len(targets))
+
+    # Melis baseline + 타깃별 gain 캐시 (각 타깃 한 번만 계산)
     baseline = melis_score(world)
     melis_gain_cache: dict = {}
 
+    committed: dict = {}
+    attack_targeted = set()
+
     RACE_SKIP_THRESHOLD = -3
 
+    # ── 4a. v9 스타일 단일 행성 공격 (while 루프, Melis 보너스 포함) ──────────────
     for mine in my_planets_sorted:
         while True:
             available = mine.ships - pending_ships[mine.id]
@@ -580,6 +552,7 @@ def agent(obs):
 
                 if already >= ships_needed:
                     continue
+
                 if available < ships_needed:
                     continue
 
@@ -589,13 +562,18 @@ def agent(obs):
 
                 iw = iwealth_cache.get(t.id, 0.0)
 
+                # Melis gain (캐시 사용)
                 if t.id not in melis_gain_cache:
-                    m = melis_score(world, t.id, int(turns), ships_needed)
-                    melis_gain_cache[t.id] = m - baseline
+                    m_score = melis_score(world,
+                                          capture_target=t.id,
+                                          capture_turn=int(turns),
+                                          capture_ships=ships_needed)
+                    melis_gain_cache[t.id] = m_score - baseline
                 gain = melis_gain_cache[t.id]
 
                 score = target_score(t, dist, ships_needed, turns, world.step,
                                      gain, margin, iw, neutral_ratio)
+
                 if score > best_score:
                     best_score  = score
                     best_result = (t, angle, ships_needed)
@@ -613,10 +591,12 @@ def agent(obs):
                 gain = melis_gain_cache.get(t.id, 0.0)
                 print(f"[ATK] {mine.id}->{t.id}: {ships_needed} ships (gain={gain:.1f})")
 
-    # ── 8. 협공(All-game Sequential Coop) ────────────────────────────────────
+    # ── 4b. 전반 게임 협공(All-game Sequential Coop) ───────────────────────────
     COOP_MIN_GARRISON = 15
     COOP_MAX_T        = 20
     COOP_SAFETY       = 5
+
+    remaining_turns = max(1, TOTAL_STEPS - world.step)
 
     for t in targets:
         if t.id in attack_targeted:
@@ -644,16 +624,20 @@ def agent(obs):
         unique_T_values = sorted(set(c[2] for c in source_candidates))
 
         best_coop = None
+
         for T in unique_T_values:
             if T > COOP_MAX_T:
                 break
+
             tx, ty = predict_position(t, world.ang_vel, T)
             garrison_T = int(t.ships) + t.production * T + COOP_SAFETY
             if garrison_T < COOP_MIN_GARRISON:
                 continue
+
             remaining_after = max(0, remaining_turns - T)
             if t.production * remaining_after < garrison_T - COOP_SAFETY:
                 continue
+
             already = my_inbound.get(t.id, 0) + committed.get(t.id, 0)
             need = garrison_T - already
             if need <= 0:
@@ -661,11 +645,16 @@ def agent(obs):
 
             contributors = []
             for mine, avail, _ in source_candidates:
+                actual_dist = math.hypot(mine.x - tx, mine.y - ty)
+                if actual_dist == 0:
+                    continue
                 result = aim_iterative(mine, t, avail, world.ang_vel)
                 if result is None:
                     continue
                 angle, ships_needed, coop_turns = result
-                if ships_needed > avail or coop_turns > T + 3:
+                if ships_needed > avail:
+                    continue
+                if coop_turns > T + 3:
                     continue
                 if path_hits_sun(mine.x, mine.y, tx, ty):
                     continue
@@ -673,7 +662,9 @@ def agent(obs):
 
             if len(contributors) < 2:
                 continue
-            if sum(c[2] for c in contributors) < need:
+
+            total_avail = sum(c[2] for c in contributors)
+            if total_avail < need:
                 continue
 
             best_coop = (T, garrison_T, need, contributors)
@@ -683,6 +674,7 @@ def agent(obs):
             continue
 
         T, garrison_T, need, contributors = best_coop
+
         contributors.sort(key=lambda c: c[2], reverse=True)
         executed = []
         remaining_need = need
@@ -699,68 +691,11 @@ def agent(obs):
             moves.append([mine.id, angle, ships_send])
             pending_ships[mine.id] += ships_send
             committed[t.id] = committed.get(t.id, 0) + ships_send
+
         attack_targeted.add(t.id)
 
         if DEBUG:
             src_str = "+".join(f"{m.id}({s})" for m, _, s in executed)
-            print(f"[COOP] target={t.id} T={T} garrison_T={garrison_T} "
-                  f"need={need} sources={src_str}")
-
-    # ── 9. Hammer/Multiprong: 일반 공격·협공 후 "잉여 함대"로만 발사 ──────────
-    # 주력을 벤치에 앉히지 않고, 공격에 다 쓰고도 남은 함대가 충분할 때만
-    # 적 요새를 일격한다. 발사 못 하면 손해 0 (= v10 동작).
-    if HAMMER_ENABLED and enemy_planets:
-        lead = max(my_planets, key=lambda p: p.ships - pending_ships[p.id])
-        lead_avail = lead.ships - pending_ships[lead.id]
-
-        if lead_avail >= HAMMER_STOCKPILE_MIN:
-            best = None
-            best_score = -math.inf
-            for t in enemy_planets:
-                if t.id in attack_targeted or t.production < HAMMER_TARGET_PROD_MIN:
-                    continue
-                result = aim_iterative(lead, t, lead_avail, world.ang_vel)
-                if result is None:
-                    continue
-                angle, ships_needed, turns = result
-                if turns > HAMMER_MAX_TRAVEL:
-                    continue
-                required = int(ships_needed * HAMMER_OVERKILL_RATIO)
-                if required > lead_avail:
-                    continue
-                remaining_after = max(0, remaining_turns - turns)
-                roi = t.production * remaining_after - required
-                if roi < 0:
-                    continue
-                score = t.production * remaining_after - turns * 2
-                if score > best_score:
-                    best_score = score
-                    best = (t, angle, required, turns)
-
-            if best is not None:
-                t_hammer, angle, required, turns = best
-                moves.append([lead.id, angle, required])
-                pending_ships[lead.id] += required
-                committed[t_hammer.id] = committed.get(t_hammer.id, 0) + required
-                attack_targeted.add(t_hammer.id)
-                if DEBUG:
-                    print(f"[HAMMER] {lead.id}->{t_hammer.id}: {required} ships "
-                          f"(turns={turns:.1f}, surplus={lead_avail})")
-
-                if MULTIPRONG_ENABLED:
-                    secondary = pick_multiprong_secondary(
-                        world, t_hammer, my_planets, enemy_planets,
-                        pending_ships, lead.id, attack_targeted, remaining_turns
-                    )
-                    if secondary is not None:
-                        src_mine, sec_tgt, sec_angle, sec_ships = secondary
-                        if sec_ships <= src_mine.ships - pending_ships[src_mine.id]:
-                            moves.append([src_mine.id, sec_angle, sec_ships])
-                            pending_ships[src_mine.id] += sec_ships
-                            committed[sec_tgt.id] = committed.get(sec_tgt.id, 0) + sec_ships
-                            attack_targeted.add(sec_tgt.id)
-                            if DEBUG:
-                                print(f"[MULTI] {src_mine.id}->{sec_tgt.id}: {sec_ships} "
-                                      f"ships (near hammer {t_hammer.id})")
+            print(f"[COOP] target={t.id} T={T} garrison_T={garrison_T} need={need} sources={src_str}")
 
     return moves

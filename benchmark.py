@@ -8,9 +8,17 @@
 """
 import argparse
 import importlib.util
+import io
 import json
+import os
 import sys
 import time
+
+# 옵션 미지정 시 기본값: 논리코어의 절반
+DEFAULT_WORKERS = max(1, (os.cpu_count() or 2) // 2)
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -58,7 +66,8 @@ def _run_match_worker(args):
             "result": r, "secs": round(time.time() - t0, 2)}
 
 
-def benchmark(names: list[str], n_games: int, out_path: str = None, workers: int = 1):
+def benchmark(names: list[str], n_games: int, out_path: str = None,
+              workers: int = DEFAULT_WORKERS):
     seeds = list(range(n_games))
     pairs = [(a, b) for i, a in enumerate(names) for b in names[i+1:]]
     total_matches = len(pairs) * n_games * 2
@@ -120,7 +129,7 @@ def benchmark(names: list[str], n_games: int, out_path: str = None, workers: int
     print(f"결과  ({n_games}게임 × 2방향 = {n_games*2}게임/쌍)")
     print(f"{'='*55}")
     for (a, b), r in results.items():
-        bar = "█" * int(r["win_pct"] / 5) + "░" * (20 - int(r["win_pct"] / 5))
+        bar = "#" * int(r["win_pct"] / 5) + "." * (20 - int(r["win_pct"] / 5))
         print(f"  {a:20s} vs {b:20s}  W{r['w']:3d} D{r['d']:2d} L{r['l']:3d}  ({r['win_pct']:5.1f}%)  {bar}")
     print(f"\n총 소요: {elapsed_total:.1f}초  (게임당 평균 {avg_per_game:.2f}초)")
 
@@ -150,8 +159,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("agents", nargs="+", help="비교할 에이전트 이름 (예: v1 v2)")
     parser.add_argument("-n", "--games", type=int, default=30, help="게임 수 (기본 30)")
-    parser.add_argument("-j", "--workers", type=int, default=4,
-                        help="병렬 워커 수 (기본 4, 1이면 순차)")
+    parser.add_argument("-j", "--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"병렬 워커 수 (기본=논리코어/2={DEFAULT_WORKERS}, 1이면 순차)")
     parser.add_argument("--out", type=str, default=None, help="결과 JSON 저장 경로")
     args = parser.parse_args()
 

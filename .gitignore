@@ -10,6 +10,9 @@ __pycache__/
 venv/
 env/
 
+# 의존성 lock (재생성 가능)
+uv.lock
+
 # 개발 임시 파일
 debug*.py
 profile_v8.py

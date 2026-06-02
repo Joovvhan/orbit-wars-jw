@@ -8,3 +8,9 @@ dependencies = [
     "kaggle-environments>=1.28.0",
     "tqdm>=4.67.3",
 ]
+
+[tool.uv]
+# pygame has no wheels for Python 3.14 — skip it (only needed for Jupyter rendering)
+override-dependencies = [
+    "pygame; python_version < '0'",
+]

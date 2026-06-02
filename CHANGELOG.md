@@ -2,6 +2,78 @@
 
 ---
 
+## v10 (확정)
+
+### 변경 내용: Melis Forward Evaluation (v9 하이브리드)
+
+**변경 내용**:
+- `forward_project`: 20턴 미래 시뮬레이션 (생산 + 전투 + 상대 이동 간이 모델)
+- `melis_score`: 스냅샷(4,8,14,20턴) 가중평균 → `ships_diff + 5×planets_diff + 8×prod_diff`
+- v9 타깃 스코어에 Melis gain 보너스 추가: `score = score_v9 + 1.5 × melis_gain`
+- v9의 while 루프 아키텍처 유지 (공격 빈도 보존)
+- 전반 게임 협공 (neutral_ratio 제약 제거)
+
+**개발 과정 핵심 교훈**:
+1. **v9 아키텍처 교체 실패**: 처음에 Melis로 v9 while 루프를 완전히 대체 → v10 vs v9 0%로 완전 실패
+2. **이중 방어 예약 버그**: `available = mine.ships - reserve`를 공격 섹션에도 적용 → 공격 자원이 0이 되어 확장 멈춤
+3. **타깃 수 제한 버그**: `SEARCH_MAX_PER_SOURCE = 4`로 후보 제한 → 대부분 공격 불가
+4. **Melis 보너스 방식 채택**: v9 while 루프 + Melis gain 보너스로 전환 → 정상 동작
+
+**최종 성능 (60게임 기준)**:
+| 상대 | v10 | v9 | v8 |
+|------|-----|-----|-----|
+| v9 | 50% | — | 53.3% |
+| v8 | 45% | 53.3% | — |
+| ex_proto | 1.7% | 0% | 1.7% |
+| ex_lb958 | 11.7% | 11.7% | 11.7% |
+
+**결론**: Melis forward evaluation이 타깃 스코어 보너스로는 중립적. ex_lb1050a와의 격차를 좁히지 못함.
+
+**ex_lb1050a 분석 (100% vs 모든 에이전트)**:
+- Hammer/Mega-hammer: 대규모 함대 적립 후 일격
+- Multiprong: 2-3개 타깃 동시 공격으로 딜레마 유발
+- Personality 시스템: patient/opportunistic/pressure 3단계 모드 전환
+- Depth-2 search: 상대 반응까지 시뮬레이션
+
+---
+
+## v10 개발 방향 (examples 패배 원인 분석)
+
+### v9 vs examples 패배 원인
+
+**1. ex_proto (0% 패배) 주요 차이점**:
+- ex_proto의 coop는 **전반 게임에서** 활성화 (v9는 late game만)
+  - `MIN_SHIPS_TARGET_COOP_ATTACK = 20`: 타깃 garrison >= 20이면 coop 시도
+  - 최대 8개 행성이 순차 도착으로 협공 (동시 도착 불필요!)
+- **`fleet_trajectories` 전역 상태**: 이전 턴 발사 정보를 다음 턴에도 기억
+  - 우리는 매 턴 `my_inbound`로 재계산하지만, ex_proto는 발사 각도+from_planet_id로 더 정확히 추적
+- **강화(reinforcement) 전용 시스템**: `reinforcement_trajectories`로 증원 발사 중복 방지
+- **3 베스트 타깃 시도**: `candidate_targets[:3]`으로 1위 타깃 실패 시 2위 시도
+
+**2. ex_lb958 (12-15% 패배) 주요 차이점**:
+- Binary search 방어 예비 함대 계산
+- WorldModel 타임라인 기반 미래 상태 시뮬레이션 (110턴 ahead)
+- Multi-source swarm with ETA tolerance = 2 (동시 도착 불필요)
+
+### v10 우선 개발 항목
+
+| 항목 | 출처 | 기대 효과 | 난이도 |
+|------|------|-----------|--------|
+| **전반 게임 coop** (neutral_ratio 제약 제거) | ex_proto | 초반 강한 타깃 공략 | 중 |
+| **순차 coop 단순화** (동시 도착 불필요, 대신 양 충분히) | ex_proto | 현재 coop보다 효율적 | 중 |
+| **fleet tracking 강화** (발사 기억) | ex_proto | 중복 발사 방지 | 중 |
+| **3 타깃 후보 시도** | ex_proto | 더 유연한 공격 | 하 |
+| **수비 후 즉시 역공** | ex_smith | 방어 후 기회 활용 | 중 |
+
+### 핵심 교훈: 동시 도착 vs 순차 도착
+
+v9 개발 중 동시 도착(simultaneous arrival)이 반드시 필요하다고 가정했으나, ex_proto 코드 분석 결과:
+- **순차 도착 coop도 충분히 효과적**: 첫 함대가 garrison을 깎고 두 번째 함대가 마무리
+- 핵심은 **총 투입 함대 > garrison** 이지 **도착 시간의 동기화**가 아님
+- v9의 ships_for_eta 역산 기법은 과-엔지니어링이었음 (적용은 유효하나 필수 아님)
+
+---
+
 ## 핵심 교훈 — 협공(Coop Attack)에 대하여
 
 ### 왜 단순 협공이 실패하는가
@@ -53,6 +125,41 @@ orbit_wars 전투 규칙:
 - path_hits_sun 검증 필수
 - 단독 공격이 가능한 타깃에는 협공 불필요 (낭비)
 - 협공 대상: 총 가용 병력 합산 >= garrison 이지만 단독으로는 불가능한 경우만
+
+---
+
+## v9 (확정)
+
+### 변경 내용: 동시 도착 협공(Simultaneous Coop Attack) 구현
+
+**변경 내용**:
+1. `ships_for_eta(dist, T)`: 이진탐색으로 정확히 T턴에 도착하는 최소 함대 크기 계산
+2. 최소 T 탐색: 후보 T값 순서대로 협공 가능 여부 확인 → 가장 이른 T 사용
+3. `len(executed) >= 2` 조건: 진짜 2-소스 이상 협공만 실행
+4. 적 행성 전용, 후반 게임(neutral_ratio < 0.35)에서만 활성화
+5. 안전 마진(+5): 적 증원 가능성 고려
+
+**개발 과정 핵심 교훈**:
+
+1. **T 선택 실수**: 처음에는 `T = max(모든 소스의 min_eta)` 사용 → 가장 먼 소스가 T를 결정해 가까운 소스들이 불필요하게 오래 기다림. 수정: 후보 T값들을 순서대로 시도하여 최소 T 탐색.
+
+2. **초반 게임 비활성화**: 협공을 전반에 실행하면 중립 확장을 방해하여 v7보다 성능 저하. 수정: neutral_ratio < 0.35 (후반)에서만 활성화.
+
+3. **my_inbound 미반영 버그**: 이미 날아가는 아군 함대를 need에서 빼지 않아 매 턴 같은 타깃에 과다 발사. 수정: `need = garrison_T - already` 적용.
+
+4. **MIN_FLEET cap 버그**: `ships_for_eta` 반환값에 `max(MIN_FLEET, ships)` 적용 시 ETA 불일치. 수정: MIN_FLEET 미달 시 해당 소스 제외.
+
+5. **단일-소스 위장 협공**: `len(contributors) >= 2` 조건이 있지만 실행 시 1개 소스만 필요한 경우 발생. 수정: `len(executed) >= 2` 조건 추가.
+
+**최종 성능 (30게임 기준)**:
+| 상대 | v9 승률 | v8 승률 |
+|------|---------|---------|
+| v8 | **53.3%** ✅ | — |
+| v7 | 58.3% | 58.3% |
+| ex_proto | 0% | 1.7% |
+| ex_lb958 | 11.7% | 15% |
+
+**결론**: v9는 v8보다 약간 강함(53.3%). examples 대비 유의미한 격차는 좁히지 못함.
 
 ---
 
