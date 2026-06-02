@@ -1,8 +1,9 @@
 """
-v8: v7 + Reserve + Hammer
-- Reserve: 각 행성의 수비 예약 병력 계산 → 잉여만 공격에 사용
-- Hammer: 임계치(HAMMER_MIN) 달성 시 적 고생산 행성 집중 타격
-- 검증: reserve가 실제 수비에 쓰이는지, hammer가 올바른 타이밍에 발사되는지
+v8: v7 + Endgame ROI 필터 + 페이즈 인식 스코어
+- Endgame ROI: 남은 턴 × production > ships_needed 일 때만 공격
+- 페이즈 스코어: 중립 소진될수록 적 행성 스코어 가중치 증가
+- v7의 race_margin, 수비/도주 모두 유지
+- 단순 스코어 조정 → 검증 가능, 안전한 개선
 - v6의 수비/도주/경로추적 유지
 """
 import math
@@ -114,47 +115,6 @@ class World:
                 if math.hypot(fx - px, fy - py) <= p.radius + 0.5:
                     return p.id
         return None
-
-
-# ─── Reserve: 행성별 수비 예약 병력 계산 ─────────────────────────────────────
-
-def compute_reserve(planet, arrivals: list, player: int) -> int:
-    """
-    이 행성에 예약해야 할 최소 병력 (수비용).
-
-    원리: 적 함대가 도착하기 전까지 누적 생산량을 더해도
-          적 병력 합계를 버티려면 얼마가 필요한가?
-
-    반환값: reserve (이 이상은 공격에 쓰면 안 됨)
-    """
-    ships = float(planet.ships)
-    arr_idx = 0
-    n = len(arrivals)
-    shortfall = 0
-
-    for turn in range(1, 61):
-        # 생산
-        ships += planet.production
-
-        # 도착 처리
-        friendly = 0
-        enemy = 0
-        while arr_idx < n and arrivals[arr_idx][0] == turn:
-            _, owner, s = arrivals[arr_idx]
-            if owner == player:
-                friendly += s
-            else:
-                enemy += s
-            arr_idx += 1
-
-        ships += friendly
-        if enemy > 0:
-            ships -= enemy
-            if ships < 0:
-                shortfall = max(shortfall, int(-ships) + 1)
-                ships = 0  # 함락 후 0 (최악 케이스 계속 계산)
-
-    return shortfall  # 이 만큼은 지금 행성에 남겨야 함
 
 
 # ─── 행성 타임라인 시뮬레이션 ──────────────────────────────────────────────────
@@ -278,73 +238,31 @@ def race_margin(target, my_planets, enemy_planets) -> float:
     return enemy_min - my_min
 
 
-# ─── Hammer: 임계치 달성 시 적 집중 타격 ──────────────────────────────────────
-
-HAMMER_MIN = 40           # 발사 기준 최소 가용 병력
-HAMMER_OVERKILL = 1.2     # 필요 병력 × 1.2 (안전 마진)
-HAMMER_MAX_TRAVEL = 35    # 이 이상 거리는 hammer 제외
-HAMMER_PROD_MIN = 2       # 이 이상 생산량 타깃만 hammer
-HAMMER_NEUTRAL_RATIO_MAX = 0.3  # 중립이 30% 이하일 때만 hammer 발동
-
-
-def find_hammer_target(my_planets, enemy_planets, available, ang_vel, step):
+def target_score(t, dist, ships_needed, turns, step,
+                 margin=0.0, iwealth=0.0, neutral_ratio=1.0) -> float:
     """
-    Hammer: 총 가용 병력이 HAMMER_MIN 이상일 때, 가장 생산량 높은 적 행성을
-    가장 가까운 내 행성에서 집중 타격. 계산 최소화(O(1) 타깃).
+    v7 스코어 + 두 가지 v8 개선:
+    1. Endgame ROI: 남은 게임 기간 대비 가치 없으면 패널티
+    2. 페이즈 스코어: 중립 소진될수록 적 행성 보너스 증가
     """
-    total_available = sum(available.get(p.id, 0) for p in my_planets)
-    if total_available < HAMMER_MIN:
-        return None
-
-    # 타깃: 생산량 가장 높은 적 행성 하나만 선택
-    candidates = [t for t in enemy_planets if t.production >= HAMMER_PROD_MIN]
-    if not candidates:
-        return None
-    tgt = max(candidates, key=lambda t: t.production)
-
-    # 가장 가까운 내 행성에서만 발사 (계산량 O(N_my_planets))
-    best_src = None
-    best_dist = math.inf
-    for src in my_planets:
-        if available.get(src.id, 0) < HAMMER_MIN:
-            continue
-        d = math.hypot(src.x - tgt.x, src.y - tgt.y)
-        if d < best_dist:
-            best_dist = d
-            best_src = src
-
-    if best_src is None:
-        return None
-
-    avail = available.get(best_src.id, 0)
-    result = aim_iterative(best_src, tgt, avail, ang_vel)
-    if result is None:
-        return None
-
-    angle, ships_needed, turns = result
-    if turns > HAMMER_MAX_TRAVEL:
-        return None
-    if avail < ships_needed:
-        return None
-
-    return tgt, [(best_src, angle, ships_needed)]
-
-
-def target_score(t, dist, ships_needed, turns, step, margin=0.0, iwealth=0.0) -> float:
-    """
-    v6 기본 스코어 + 중립 쟁탈 여유 반영
-    - 내가 먼저 도착 가능한 중립: 보너스
-    - 적이 먼저 도착하는 중립: 페널티 (건너뜀 처리는 호출부에서)
-    - 적 행성: v6와 동일
-    """
+    remaining = max(1, TOTAL_STEPS - step)
     enemy_bonus = 10 if t.owner >= 0 else 0
     base = (100 - dist) + 15 * t.production + enemy_bonus \
            - 0.7 * ships_needed - 2 * turns + iwealth * 0.15
 
-    if t.owner < 0:  # 중립만 race margin 반영
-        # 여유 +5턴: 큰 보너스 (확실히 확보 가능)
-        # 여유 -2턴 이하: 사실상 불가 (큰 페널티)
+    if t.owner < 0:  # 중립: race margin
         base += margin * 3.0
+    else:            # 적 행성: 페이즈 보너스
+        # 중립이 적을수록(후반) 적 공략 중요도 증가
+        # neutral_ratio=1(초반) → +0, neutral_ratio=0(후반) → +30
+        phase_bonus = (1.0 - neutral_ratio) * 30.0
+        base += phase_bonus
+
+    # Endgame ROI 필터: production × remaining_after < ships_needed → 손해
+    remaining_after = max(0, remaining - turns)
+    roi = t.production * remaining_after - ships_needed
+    if roi < 0:
+        base += roi * 0.5  # 손해인 공격에 페널티 (완전 차단 아님)
 
     return base
 
@@ -366,18 +284,11 @@ def agent(obs):
     # pending_ships[pid]: 이번 턴 이미 발사 예약된 함대
     pending_ships = {p.id: 0 for p in my_planets}
 
-    # ── 1. Reserve 계산: 행성별 수비 예약 병력 ────────────────────────────────
-    reserves: dict[int, int] = {}
+    # ── 1. 내 행성 타임라인 시뮬레이션 ────────────────────────────────────────
     timelines: dict[int, PlanetTimeline] = {}
     for p in my_planets:
         arrivals = world.arrivals_by_planet.get(p.id, [])
-        reserves[p.id] = compute_reserve(p, arrivals, player)
         timelines[p.id] = simulate_planet_timeline(p, arrivals, player)
-
-    # available_for_attack: v7과 동일하게 전체 병력 사용
-    # reserve 정보는 방어(defense) 판단에만 활용, 공격 자원은 제한하지 않음
-    # (reserve로 공격 제한 시 초반 중립 확장이 심각하게 저하됨)
-    available_for_attack = {p.id: int(p.ships) for p in my_planets}
 
     # ── 2. 도주(Evacuation): 잃을 행성 함대 대피 ──────────────────────────────
     # 도주 대상: 함락이 확실한 행성, 10턴 이내 함락 예정
@@ -467,35 +378,7 @@ def agent(obs):
             if needed <= 0:
                 break
 
-    # ── 4. Hammer: 임계치 달성 시 적 집중 타격 ────────────────────────────────
-    enemy_planets = [p for p in planets if p.owner not in (-1, player)]
-    hammer_result = None
-
-    n_neutral = sum(1 for p in planets if p.owner < 0)
-    neutral_ratio = n_neutral / max(1, len(targets))
-
-    # Hammer: 5턴마다만 실행 (매 턴 실행 시 aim_iterative 누적으로 느려짐)
-    if enemy_planets and neutral_ratio <= HAMMER_NEUTRAL_RATIO_MAX and world.step % 5 == 0:
-        # pending 반영한 현재 가용 병력
-        cur_available = {
-            p.id: max(0, available_for_attack[p.id] - pending_ships[p.id])
-            for p in my_planets
-        }
-        hammer_result = find_hammer_target(
-            my_planets, enemy_planets, cur_available, world.ang_vel, world.step
-        )
-
-    hammer_committed: dict = {}  # hammer가 커밋한 병력 (regular attack이 중복 방지에 활용)
-    if hammer_result:
-        tgt, plan = hammer_result
-        for src, angle, send in plan:
-            moves.append([src.id, angle, send])
-            pending_ships[src.id] += send
-            hammer_committed[tgt.id] = hammer_committed.get(tgt.id, 0) + send
-            if DEBUG:
-                print(f"[HAMMER] {src.id}->{tgt.id}: {send}척 (prod={tgt.production})")
-
-    # ── 5. 일반 공격: reserve 기반 가용 병력으로 ──────────────────────────────
+    # ── 4. 공격: indirect wealth + multiprong 포함 ────────────────────────────
     if not targets:
         return moves
 
@@ -512,21 +395,24 @@ def agent(obs):
     iwealth_cache = {t.id: indirect_wealth(t, planets, player) for t in targets}
 
 
-    # race_margin 미리 계산 (중립 타깃별)
+    # race_margin + neutral_ratio 계산
+    enemy_planets = [p for p in planets if p.owner not in (-1, player)]
     race_margins = {}
     for t in targets:
         if t.owner < 0:
             race_margins[t.id] = race_margin(t, my_planets, enemy_planets)
 
+    n_neutral = sum(1 for t in targets if t.owner < 0)
+    neutral_ratio = n_neutral / max(1, len(targets))
+
     committed: dict = {}
     attack_targeted = set()
 
-    # ── 5a. 단일 행성 공격 (reserve 차감 후 가용 병력 사용) ───────────────────
-    RACE_SKIP_THRESHOLD = -3
+    # ── 4a. 단일 행성 공격 ─────────────────────────────────────────────────────
+    RACE_SKIP_THRESHOLD = -3  # 적이 3턴 이상 빠르면 건너뜀
     for mine in my_planets_sorted:
         while True:
-            # reserve 차감: 수비 예약 후 남은 것만 공격에 사용
-            available = available_for_attack[mine.id] - pending_ships[mine.id]
+            available = mine.ships - pending_ships[mine.id]
             if available < MIN_FLEET:
                 break
 
@@ -536,9 +422,9 @@ def agent(obs):
             for t in targets:
                 if t.id in attack_targeted:
                     continue
+
                 dist = math.hypot(mine.x - t.x, mine.y - t.y)
-                # hammer 커밋도 포함해서 중복 공격 방지
-                already = my_inbound.get(t.id, 0) + committed.get(t.id, 0) + hammer_committed.get(t.id, 0)
+                already = my_inbound.get(t.id, 0) + committed.get(t.id, 0)
 
                 result = aim_iterative(mine, t, mine.ships, world.ang_vel)
                 if result is None:
@@ -558,7 +444,8 @@ def agent(obs):
                     continue
 
                 iw = iwealth_cache.get(t.id, 0.0)
-                score = target_score(t, dist, ships_needed, turns, world.step, margin, iw)
+                score = target_score(t, dist, ships_needed, turns, world.step,
+                                     margin, iw, neutral_ratio)
 
                 if score > best_score:
                     best_score  = score
